@@ -325,6 +325,8 @@
     (cmp-num (.-e d1) (.-e d2))
     (cmp-num (.-tx d1) (.-tx d2))))
 
+(defn cmp-datoms-fulltext [^Datom d1, ^Datom d2]
+  (cmp (.-a d1) (.-a d2)))
 
 ;; fast versions without nil checks
 
@@ -357,6 +359,9 @@
     (compare (.-v d1) (.-v d2))
     (#?(:clj Long/compare :cljs -) (.-e d1) (.-e d2))
     (#?(:clj Long/compare :cljs -) (.-tx d1) (.-tx d2))))
+
+(defn cmp-datoms-fulltext-quick [^Datom d1, ^Datom d2]
+  (cmp-attr-quick (.-a d1) (.-a d2)))
 
 ;; ----------------------------------------------------------------------------
 
@@ -539,9 +544,10 @@
       (case k
         :db/isComponent [:db/isComponent]
         :db/index       [:db/index]
+        :db/fulltext    [:db/fulltext]
         []))))
 
-(defn- rschema [schema]
+(defn- reverse-schema [schema]
   (reduce-kv
     (fn [m attr keys->values]
       (reduce-kv
@@ -579,16 +585,16 @@
 (defn ^DB empty-db
   ([] (empty-db default-schema))
   ([schema]
-    {:pre [(or (nil? schema) (map? schema))]}
-    (map->DB {
-      :schema  (validate-schema schema)
-      :eavt    (btset/btset-by cmp-datoms-eavt)
-      :aevt    (btset/btset-by cmp-datoms-aevt)
-      :avet    (btset/btset-by cmp-datoms-avet)
-      :max-eid 0
-      :max-tx  tx0
-      :rschema (rschema schema)
-      :hash    (atom 0)})))
+   {:pre [(or (nil? schema) (map? schema))]}
+   (map->DB {:schema   (validate-schema schema)
+             :eavt     (btset/btset-by cmp-datoms-eavt)
+             :aevt     (btset/btset-by cmp-datoms-aevt)
+             :avet     (btset/btset-by cmp-datoms-avet)
+             :fulltext (btset/btset-by cmp-datoms-fulltext)
+             :max-eid 0
+             :max-tx  tx0
+             :rschema (reverse-schema schema)
+             :hash    (atom 0)})))
 
 (defn- init-max-eid [eavt]
   (if-let [slice (btset/slice
@@ -601,10 +607,10 @@
 (defn ^DB init-db
   ([datoms] (init-db datoms default-schema))
   ([datoms schema]
-    (if (empty? datoms)
+   (if (empty? datoms)
       (empty-db schema)
       (let [_ (validate-schema schema)
-            rschema (rschema schema)
+            rschema (reverse-schema schema)
             indexed (:db/index rschema)
             #?@(:cljs
                 [ds-arr  (if (array? datoms) datoms (da/into-array datoms))
@@ -625,15 +631,15 @@
                  avet        (apply btset/btset-by cmp-datoms-avet avet-datoms)
                  max-eid     (init-max-eid eavt)])
             max-tx (transduce (map (fn [^Datom d] (.-tx d))) max tx0 eavt)]
-        (map->DB {
-          :schema  schema
-          :eavt    eavt
-          :aevt    aevt
-          :avet    avet
-          :max-eid max-eid
-          :max-tx  max-tx
-          :rschema rschema
-          :hash    (atom 0)})))))
+        (map->DB {:schema   schema
+                  :eavt     eavt
+                  :aevt     aevt
+                  :avet     avet
+                  ; @TODO :fulltext fulltext
+                  :max-eid  max-eid
+                  :max-tx   max-tx
+                  :rschema  rschema
+                  :hash     (atom 0)})))))
 
 (defn- equiv-db-index [x y]
   (loop [xs (seq x)
@@ -718,7 +724,8 @@
   (case index
     :eavt (resolve-datom db c0 c1 c2 c3)
     :aevt (resolve-datom db c1 c0 c2 c3)
-    :avet (resolve-datom db c2 c0 c1 c3)))
+    :avet (resolve-datom db c2 c0 c1 c3)
+    :fulltext (resolve-datom db c1 c0 c2 c3)))
 
 ;; ----------------------------------------------------------------------------
 
@@ -743,6 +750,10 @@
 (defn #?@(:clj  [^Boolean indexing?]
           :cljs [^boolean indexing?]) [db attr]
   (is-attr? db attr :db/index))
+
+(defn #?@(:clj  [^Boolean fulltext?]
+          :cljs [^boolean fulltext?]) [db attr]
+  (is-attr? db attr :db/fulltext))
 
 (defn entid [db eid]
   {:pre [(db? db)]}
@@ -823,7 +834,7 @@
 
 (defn- allocate-eid
   ([report eid]
-    (update-in report [:db-after] advance-max-eid eid))
+   (update-in report [:db-after] advance-max-eid eid))
   ([report e eid]
     (cond-> report
       (neg-number? e)
@@ -838,12 +849,14 @@
 
 (defn- with-datom [db ^Datom datom]
   (validate-datom db datom)
-  (let [indexing? (indexing? db (.-a datom))]
+  (let [indexing? (indexing? db (.-a datom))
+        fulltext? (fulltext? db (.-a datom))]
     (if (.-added datom)
       (cond-> db
         true      (update-in [:eavt] btset/btset-conj datom cmp-datoms-eavt-quick)
         true      (update-in [:aevt] btset/btset-conj datom cmp-datoms-aevt-quick)
         indexing? (update-in [:avet] btset/btset-conj datom cmp-datoms-avet-quick)
+        fulltext? (update-in [:fulltext] btset/btset-conj datom cmp-datoms-fulltext-quick)
         true      (advance-max-eid (.-e datom))
         true      (assoc :hash (atom 0)))
       (if-let [removing (first (-search db [(.-e datom) (.-a datom) (.-v datom)]))]
@@ -851,6 +864,7 @@
           true      (update-in [:eavt] btset/btset-disj removing cmp-datoms-eavt-quick)
           true      (update-in [:aevt] btset/btset-disj removing cmp-datoms-aevt-quick)
           indexing? (update-in [:avet] btset/btset-disj removing cmp-datoms-avet-quick)
+          fulltext? (update-in [:fulltext] btset/btset-disj datom cmp-datoms-fulltext-quick)
           true      (assoc :hash (atom 0)))
         db))))
 
